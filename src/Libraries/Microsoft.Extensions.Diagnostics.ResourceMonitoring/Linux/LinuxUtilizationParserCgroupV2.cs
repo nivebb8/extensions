@@ -95,7 +95,7 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         }
 
         // Find the index of the first colon (:)
-        int colonIndex = fileContent.IndexOf(':');
+        int colonIndex = fileContent.LastIndexOf(':');
         if (colonIndex == -1 || colonIndex + 1 >= fileContent.Length)
         {
             throw new InvalidOperationException($"Invalid format in file '{_cpuActualSelfSliceProcFile}'. Expected content with ':' separator.");
@@ -105,7 +105,7 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         ReadOnlySpan<char> trimmedPath = fileContent.Slice(colonIndex + 1);
 
         // Prepend the path prefix and append the filename
-        string updatedPath = $"{PathPrefix}{trimmedPath.ToString()}/{filename}";
+        string updatedPath = $"{PathPrefix}{trimmedPath.ToString()}{filename}";
 
         return updatedPath;
     }
