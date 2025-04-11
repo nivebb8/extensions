@@ -104,8 +104,15 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         // Extract the part after the last colon
         ReadOnlySpan<char> trimmedPath = fileContent.Slice(colonIndex + 1);
 
+        string trimmedPathString = trimmedPath.ToString();
+
+        if (!trimmedPathString.EndsWith('/'))
+        {
+            trimmedPathString += '/';
+        }
+
         // Prepend the path prefix and append the filename
-        string updatedPath = $"{PathPrefix}{trimmedPath.ToString()}{filename}";
+        string updatedPath = $"{PathPrefix}{trimmedPathString}{filename}";
 
         return updatedPath;
     }
