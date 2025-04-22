@@ -19,6 +19,8 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
     // Meters to track CPU utilization threshold exceedances
     private readonly Counter<long>? _cpuUtilizationLimit100PercentExceededCounter;
     private readonly Counter<long>? _cpuUtilizationLimit110PercentExceededCounter;
+    private double _cpuLimit = double.NaN;
+    private double _cpuRequest = double.NaN;
 
     private readonly object _cpuLocker = new();
     private readonly object _memoryLocker = new();
@@ -84,7 +86,8 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
 
             // Try to get the CPU request from cgroup
             cpuRequest = _parser.GetCgroupRequestCpuV2();
-
+            _cpuLimit = cpuLimit;
+            _cpuRequest = cpuRequest;
             // Initialize the counters
             _cpuUtilizationLimit100PercentExceededCounter = meter.CreateCounter<long>("cpu_utilization_limit_100_percent_exceeded");
             _cpuUtilizationLimit110PercentExceededCounter = meter.CreateCounter<long>("cpu_utilization_limit_110_percent_exceeded");
@@ -118,6 +121,7 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
         {
             if (now < _refreshAfterCpu)
             {
+                Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilizationWithoutHostDelta - Using cached value: {_lastCpuCoresUsed}");
                 return _lastCpuCoresUsed;
             }
         }
@@ -135,6 +139,7 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
                     double coresUsed = deltaCgroup / actualElapsedNanoseconds;
 
                     Log.CpuUsageDataV2(_logger, cgroupCpuTime, _previousCgroupCpuTime, actualElapsedNanoseconds, coresUsed);
+                    Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilizationWithoutHostDelta -  Start: now={now}, lastMeasurement={_lastCpuMeasurementTime}, elapsed={actualElapsedNanoseconds}ns, cgroupCpuTime={cgroupCpuTime}, previous={_previousCgroupCpuTime}, Calculated cores used: {coresUsed} (delta={deltaCgroup})");
 
                     _lastCpuCoresUsed = coresUsed;
                     _refreshAfterCpu = now.Add(_cpuRefreshInterval);
@@ -143,9 +148,13 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
                     // Update the timestamp for next calculation
                     _lastCpuMeasurementTime = now;
                 }
+                else {
+                    Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilizationWithoutHostDelta - No change in CPU time (delta={deltaCgroup})");
+                }
             }
         }
 
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilizationWithoutHostDelta - Result: {_lastCpuCoresUsed}");
         return _lastCpuCoresUsed;
     }
 
@@ -180,17 +189,21 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
     public double CpuUtilization()
     {
         DateTimeOffset now = _timeProvider.GetUtcNow();
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - Start: now={now}");
 
         lock (_cpuLocker)
         {
             if (now < _refreshAfterCpu)
             {
+                Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - Using cached value: {_cpuPercentage}");
                 return _cpuPercentage;
             }
         }
 
         long hostCpuTime = _parser.GetHostCpuUsageInNanoseconds();
         long cgroupCpuTime = _parser.GetCgroupCpuUsageInNanoseconds();
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - hostCpuTime={hostCpuTime}, cgroupCpuTime={cgroupCpuTime}");
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - previous values: hostCpu={_previousHostCpuTime}, cgroupCpu={_previousCgroupCpuTime}");
 
         lock (_cpuLocker)
         {
@@ -198,10 +211,12 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
             {
                 long deltaHost = hostCpuTime - _previousHostCpuTime;
                 long deltaCgroup = cgroupCpuTime - _previousCgroupCpuTime;
+                Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - deltaHost={deltaHost}, deltaCgroup={deltaCgroup}");
 
                 if (deltaHost > 0 && deltaCgroup > 0)
                 {
                     double percentage = Math.Min(One, (double)deltaCgroup / deltaHost);
+                    Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - Calculated percentage: {percentage} (deltaCgroup/deltaHost={(double)deltaCgroup / deltaHost})");
 
                     Log.CpuUsageData(_logger, cgroupCpuTime, hostCpuTime, _previousCgroupCpuTime, _previousHostCpuTime, percentage);
 
@@ -210,9 +225,13 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
                     _previousCgroupCpuTime = cgroupCpuTime;
                     _previousHostCpuTime = hostCpuTime;
                 }
+                else {
+                    Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - No valid delta values (deltaHost={deltaHost}, deltaCgroup={deltaCgroup})");
+                }
             }
         }
 
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} CpuUtilization - Result: {_cpuPercentage}");
         return _cpuPercentage;
     }
 
@@ -244,6 +263,30 @@ internal sealed class LinuxUtilizationProvider : ISnapshotProvider
         Log.MemoryUsageData(_logger, memoryUsed, _memoryLimit, _memoryPercentage);
 
         return _memoryPercentage;
+    }
+
+    public double ContainerCpuLimitUtilization()
+    {
+        double cpuUtilization = CpuUtilizationWithoutHostDelta();
+        double result = cpuUtilization / _cpuLimit;
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ContainerCpuLimitUtilization - CPU utilization: {cpuUtilization}, CPU limit: {_cpuLimit}, Result: {result}");
+        return result;
+    }
+
+    public double ContainerCpuRequestUtilization()
+    {
+        double cpuUtilization = CpuUtilizationWithoutHostDelta();
+        double result = cpuUtilization / _cpuRequest;
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ContainerCpuRequestUtilization - CPU utilization: {cpuUtilization}, CPU request: {_cpuRequest}, Result: {result}");
+        return result;
+    }
+
+    public double ProcessCpuUtilizationWithoutHostDelta()
+    {
+        double cpuUtilization = CpuUtilizationWithoutHostDelta();
+        double result = cpuUtilization / _cpuRequest;
+        Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ProcessCpuUtilizationWithoutHostDelta - CPU utilization: {cpuUtilization}, CPU request: {_cpuRequest}, Result: {result}");
+        return result;
     }
 
     /// <remarks>
