@@ -232,6 +232,17 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         return GetHostCpuCount();
     }
 
+    public long GetCgroupPeriodsIntervalV2()
+    {
+        FileInfo cpuLimitsFile = new(GetCgroupPath(CpuLimit));
+        if (LinuxUtilizationParserCgroupV2.TryGetCpuPeriodsFromCgroupsV2(_fileSystem, cpuLimitsFile, out long periods))
+        {
+            return periods;
+        }
+
+        return (long)GetHostCpuCount();
+    }
+
     /// <remarks>
     /// If we are able to read the CPU share, we calculate the CPU request based on the weight by dividing it by 1024.
     /// If we can't read the CPU weight, we assume that the pod/vm cpu request is 1 core by default.
@@ -510,6 +521,41 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
                 $"Could not parse '{_cpuSetCpus}'. Expected comma-separated list of integers, with dashes (\"-\") based ranges (\"0\", \"2-6,12\") but got '{new string(content)}'.");
     }
 
+    /// <summary>
+    /// Parses the number of periods from the cpu.stat file.
+    /// </summary>
+    /// <param name="fileSystem">The file system to use for reading the file.</param>
+    /// <param name="cpuStatFile">The file info for the cpu.stat file.</param>
+    /// <returns>The number of periods.</returns>
+    private static long ParseCpuPeriodsFromFile(IFileSystem fileSystem, FileInfo cpuStatFile)
+    {
+        // The value we are interested in starts with this.
+        const string Nr_periods = "nr_periods";
+
+        using ReturnableBufferWriter<char> bufferWriter = new(_sharedBufferWriterPool);
+        fileSystem.ReadAll(cpuStatFile, bufferWriter.Buffer);
+        ReadOnlySpan<char> content = bufferWriter.Buffer.WrittenSpan;
+
+        // Since nr_periods might be on any line (commonly the 4th line),
+        // we need to search for it in the entire content
+        int index = content.IndexOf(Nr_periods);
+        if (index == -1)
+        {
+            Throw.InvalidOperationException($"Could not parse '{cpuStatFile}'. Expected to find 'nr_periods' but it was not present in the file content.");
+        }
+
+        ReadOnlySpan<char> periodsSlice = content.Slice(index + Nr_periods.Length);
+
+        int next = GetNextNumber(periodsSlice, out long periods);
+
+        if (periods == -1)
+        {
+            Throw.InvalidOperationException($"Could not get nr_periods from '{cpuStatFile}'. Expected positive number, but got '{new string(content.Slice(index))}'.");
+        }
+
+        return periods;
+    }
+
     private static long ParseCpuUsageFromFile(IFileSystem fileSystem, FileInfo cpuUsageFile)
     {
         // The value we are interested in starts with this. We just want to make sure it is true.
@@ -600,6 +646,17 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         return TryParseCpuQuotaAndPeriodFromFile(fileSystem, cpuLimitsFile, out cpuUnits);
     }
 
+        private static bool TryGetCpuPeriodsFromCgroupsV2(IFileSystem fileSystem, FileInfo cpuLimitsFile, out long cpuPeriods)
+    {
+        if (!fileSystem.Exists(cpuLimitsFile))
+        {
+            cpuPeriods = 1;
+            return false;
+        }
+
+        return TryParseCpuPeriodFromFile(fileSystem, cpuLimitsFile, out cpuPeriods);
+    }
+
     private static bool TryParseCpuQuotaAndPeriodFromFile(IFileSystem fileSystem, FileInfo cpuLimitsFile, out float cpuUnits)
     {
         using ReturnableBufferWriter<char> bufferWriter = new(_sharedBufferWriterPool);
@@ -637,6 +694,47 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         }
 
         cpuUnits = (float)quota / period;
+
+        return true;
+    }
+
+        private static bool TryParseCpuPeriodFromFile(IFileSystem fileSystem, FileInfo cpuLimitsFile, out long cpuPeriods)
+    {
+        using ReturnableBufferWriter<char> bufferWriter = new(_sharedBufferWriterPool);
+        fileSystem.ReadFirstLine(cpuLimitsFile, bufferWriter.Buffer);
+
+        ReadOnlySpan<char> quotaBuffer = bufferWriter.Buffer.WrittenSpan;
+
+        if (quotaBuffer.IsEmpty || (quotaBuffer.Length == 2 && quotaBuffer[0] == '-' && quotaBuffer[1] == '1'))
+        {
+            cpuPeriods = -1;
+            return false;
+        }
+
+        if (quotaBuffer.StartsWith("max", StringComparison.InvariantCulture))
+        {
+            cpuPeriods = 1;
+            return false;
+        }
+
+        _ = GetNextNumber(quotaBuffer, out long quota);
+
+        if (quota == -1)
+        {
+            Throw.InvalidOperationException($"Could not parse '{cpuLimitsFile}'. Expected an integer but got: '{new string(quotaBuffer)}'.");
+        }
+
+        string quotaString = quota.ToString(CultureInfo.CurrentCulture);
+        int index = quotaBuffer.IndexOf(quotaString.AsSpan());
+        ReadOnlySpan<char> cpuPeriodSlice = quotaBuffer.Slice(index + quotaString.Length, quotaBuffer.Length - index - quotaString.Length);
+        _ = GetNextNumber(cpuPeriodSlice, out long period);
+
+        if (period == -1)
+        {
+            Throw.InvalidOperationException($"Could not parse '{cpuLimitsFile}'. Expected to get an integer but got: '{new string(cpuPeriodSlice)}'.");
+        }
+
+        cpuPeriods = (long) period;
 
         return true;
     }
@@ -720,5 +818,65 @@ internal sealed class LinuxUtilizationParserCgroupV2 : ILinuxUtilizationParser
         }
 
         return memoryUsage;
+    }
+
+    /// <summary>
+    /// Gets both CPU usage in nanoseconds and the number of periods at the same time from cgroup v2 files.
+    /// </summary>
+    /// <remarks>
+    /// If the file doesn't exist, we assume that the system is a Host and we read the CPU usage from /proc/stat.
+    /// For periods, we default to 1 if the cgroup file doesn't exist.
+    /// </remarks>
+    /// <returns>A tuple containing CPU usage in nanoseconds and number of periods</returns>
+    public (long CpuUsageNanoseconds, long NrPeriods) GetCpuUsageAndPeriods()
+    {
+        FileInfo cpuStatFile = new(GetCgroupPath(CpuStat));
+
+        // If the file doesn't exist, we assume that the system is a Host
+        if (!_fileSystem.Exists(cpuStatFile))
+        {
+            return (GetHostCpuUsageInNanoseconds(), 1);
+        }
+
+        // The values we are interested in start with these prefixes
+        const string UsageUsec = "usage_usec";
+        const string NrPeriods = "nr_periods";
+
+        using ReturnableBufferWriter<char> bufferWriter = new(_sharedBufferWriterPool);
+        _fileSystem.ReadAll(cpuStatFile, bufferWriter.Buffer);
+        ReadOnlySpan<char> content = bufferWriter.Buffer.WrittenSpan;
+
+        // Parse usage_usec
+        int usageIndex = content.IndexOf(UsageUsec);
+        if (usageIndex == -1)
+        {
+            Throw.InvalidOperationException($"Could not parse '{cpuStatFile}'. Expected to find 'usage_usec' but it was not present in the file content.");
+        }
+
+        ReadOnlySpan<char> usageSlice = content.Slice(usageIndex + UsageUsec.Length);
+        int usageNext = GetNextNumber(usageSlice, out long microseconds);
+
+        if (microseconds == -1)
+        {
+            Throw.InvalidOperationException($"Could not get usage_usec from '{cpuStatFile}'. Expected positive number, but got '{new string(content.Slice(usageIndex))}'.");
+        }
+
+        // Parse nr_periods
+        int periodsIndex = content.IndexOf(NrPeriods);
+        if (periodsIndex == -1)
+        {
+            Throw.InvalidOperationException($"Could not parse '{cpuStatFile}'. Expected to find 'nr_periods' but it was not present in the file content.");
+        }
+
+        ReadOnlySpan<char> periodsSlice = content.Slice(periodsIndex + NrPeriods.Length);
+        int periodsNext = GetNextNumber(periodsSlice, out long periods);
+
+        if (periods == -1)
+        {
+            Throw.InvalidOperationException($"Could not get nr_periods from '{cpuStatFile}'. Expected positive number, but got '{new string(content.Slice(periodsIndex))}'.");
+        }
+
+        // Convert microseconds to nanoseconds to maintain compatibility with existing logic
+        return (microseconds * Thousand, periods);
     }
 }

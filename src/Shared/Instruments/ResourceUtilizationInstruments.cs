@@ -26,6 +26,8 @@ internal static class ResourceUtilizationInstruments
     /// </remarks>
     public const string ContainerCpuLimitUtilization = "container.cpu.limit.utilization";
 
+    public const string ContainerCpuLimitUtilizationByPeriods = "container.cpu.limit.utilization.by.periods";
+
     /// <summary>
     /// The name of an instrument to retrieve CPU request consumption of all processes running inside a container or control group in range <c>[0, 1]</c>.
     /// </summary>

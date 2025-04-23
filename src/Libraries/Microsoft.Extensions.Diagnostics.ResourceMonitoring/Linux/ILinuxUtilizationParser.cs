@@ -89,4 +89,16 @@ internal interface ILinuxUtilizationParser
     /// </summary>
     /// <returns>cpuPodRequest.</returns>
     float GetCgroupRequestCpuV2();
+
+    /// <summary>
+    /// For CgroupV2 only and experimental. Reads the number of CPU periods from cpu.stat based on /proc/self/cgroup.
+    /// </summary>
+    /// <returns>The number of CPU periods.</returns>
+    long GetCgroupPeriodsIntervalV2();
+
+    /// <summary>
+    /// Gets both CPU usage in nanoseconds and the number of periods at the same time from cgroup v2 files.
+    /// </summary>
+    /// <returns>A tuple containing CPU usage in nanoseconds and number of periods.</returns>
+    (long CpuUsageNanoseconds, long NrPeriods) GetCpuUsageAndPeriods();
 }
